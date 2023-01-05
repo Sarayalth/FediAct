@@ -424,7 +424,7 @@ async function resolveTootToHome(searchstring) {
 	if (response) {
 		response = JSON.parse(response)
 		// do we have a status as result?
-		if (!response.accounts.length && response.statuses.length) {
+		if (response.statuses.length) {
 			var status = response.statuses[0]
 			if (status.poll) {
 				return [[status.account.acct, status.id, status.reblogged, status.favourited, status.bookmarked, status.account.id], [status.poll.id, status.poll.voted]]
