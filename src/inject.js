@@ -39,7 +39,9 @@ const settingsDefaults = {
 	fediact_runifloggedin: false,
 	fediact_mutes: [],
 	fediact_blocks: [],
-	fediact_domainblocks: []
+	fediact_domainblocks: [],
+	fediact_client_id: null,
+    fediact_client_secret: null,
 }
 const tmpSettings = {
 	fedireply: undefined,

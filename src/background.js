@@ -5,12 +5,17 @@ const tokenInterval = 1 // minutes
 const mutesApi = "/api/v1/mutes"
 const blocksApi = "/api/v1/blocks"
 const domainBlocksApi = "/api/v1/domain_blocks"
+const appsApi = "/api/v1/apps"
+const oauthAuthorizeApi = "/oauth/authorize"
+const oauthTokenApi = "/oauth/token"
+const oauthRevokeApi = "/oauth/revoke"
 const timeout = 15000
-const tokenRegex = /"access_token":".*?",/gm
 // required settings keys with defauls
 const settingsDefaults = {
 	fediact_homeinstance: null,
-    fediact_token: null
+    fediact_token: null,
+    fediact_client_id: null,
+    fediact_client_secret: null,
 }
 
 // wrapper to prepend to log messages
@@ -98,39 +103,141 @@ async function generalRequest(data) {
 }
 
 // fetch API token here (will use logged in session automatically)
-async function fetchBearerToken() {
+async function createApp() {
     return new Promise(async function(resolve) {
-        var url = "https://" + settings.fediact_homeinstance
+        urlParams = new  URLSearchParams({
+            client_name: "FediAct",
+            redirect_uris: (browser || chrome).identity.getRedirectURL("oauth2"),
+            scopes: "read write follow"
+        })
+        var url = "https://" + settings.fediact_homeinstance + appsApi
         try {
-            var res = await fetch(url)
-            var text = await res.text()
+            var res = await fetch(url,
+                {
+                    method: "POST",
+                    body: urlParams
+                })
+            var json = await res.json()
         } catch(e) {
             log(e)
             resolve(false)
             return
         }
-        if (text) {
-            // dom parser is not available in background workers, so we use regex to parse the html....
-            // for some reason, regex groups do also not seem to work in chrome background workers... the following is ugly but should work fine
-            var content = text.match(tokenRegex)
-            if (content) {
-                var indexOne = content[0].search(/"access_token":"/)
-                var indexTwo = content[0].search(/",/)
-                if (indexOne > -1 && indexTwo > -1) {
-                    indexOne = indexOne + 16
-                    var token = content[0].substring(indexOne, indexTwo)
-                    if (token.length > 16) {
-                        settings.fediact_token = token
-                        resolve(true)
-                        return
-                    }
-                }
+        if (json) {
+            settings.fediact_client_id = json["client_id"]
+            settings.fediact_client_secret = json["client_secret"]
+            resolve(true)
+            return
+        }
+        resolve(false)
+    })
+}
+
+// asks the user to log into their account and starts the oauth process
+async function prepareAuth() {
+    return new Promise(async function(resolve) {
+        home = settings.fediact_homeinstance
+        redirectUri = (browser || chrome).identity.getRedirectURL("oauth2")
+        urlParams = new  URLSearchParams({
+            response_type: "code",
+            client_id: settings.fediact_client_id,
+            redirect_uri: redirectUri,
+            scope: "read write follow",
+            state: btoa(JSON.stringify({
+                home,
+                redirectUri,
+              }))
+        })
+        let url = `https://${settings.fediact_homeinstance}${oauthAuthorizeApi}?${urlParams.toString()}`;
+        log(url);
+        (browser || chrome).identity.launchWebAuthFlow({'url': url, 'interactive': true}, async function (redirectUrl) {
+            if (redirectUrl) {
+                log(`launchWebAuthFlow login successful: ${redirectUrl}`)
+                let params = new URLSearchParams(new URL(redirectUrl).search);
+                let code = params.get("code");
+                await getToken(code);
+                log('Background login complete')
+                resolve(true)
+                return
+            } else {
+                log("launchWebAuthFlow login failed. Is your redirect URL (" + redirectUri + ") configured with your OAuth2 provider?")
+                settings.fediact_token = null
+                resolve(false)
+                return
+            }
+          })
+        resolve(false)
+    })
+}
+
+// gets the oauth token
+async function getToken(code) {
+    return new Promise(async function(resolve) {
+        urlParams = new  URLSearchParams({
+            grant_type: "authorization_code",
+            code: code,
+            client_id: settings.fediact_client_id,
+            client_secret: settings.fediact_client_secret,
+            redirect_uri: (browser || chrome).identity.getRedirectURL("oauth2"),
+        })
+        var url = `https://${settings.fediact_homeinstance}${oauthTokenApi}`;
+        try {
+            var res = await fetch(url,
+                {
+                    method: "POST",
+                    body: urlParams
+                })
+            var json = await res.json()
+        } catch(e) {
+            log(e)
+            resolve(false)
+            return
+        }
+        if (json) {
+            settings.fediact_token = json["access_token"]
+            await (browser || chrome).storage.local.set(settings)
+            resolve(true)
+            return
+        }
+        resolve(false)
+    })
+}
+
+// revokes the saved oauth token
+async function revokeToken() {
+    return new Promise(async function(resolve) {
+        if(settings.fediact_token) {
+            urlParams = new  URLSearchParams({
+                client_id: settings.fediact_client_id,
+                client_secret: settings.fediact_client_secret,
+                token: settings.fediact_token,
+            })
+            var url = `https://${settings.fediact_homeinstance}${oauthRevokeApi}`;
+            try {
+                var res = await fetch(url,
+                    {
+                        method: "POST",
+                        body: urlParams
+                    })
+                resolve(true)
+            } catch(e) {
+                log(e)
+                resolve(false)
             }
         }
-        // reset token for inject.js to know
         settings.fediact_token = null
-        log("Token could not be found.")
+        await (browser || chrome).storage.local.set(settings)
         resolve(false)
+    })
+}
+
+// removes the saved oauthApp data
+async function removeOauthData() {
+    return new Promise(async function(resolve) {
+        settings.fediact_client_id = null
+        settings.fediact_client_secret = null
+        await (browser || chrome).storage.local.set(settings)
+        resolve(true)
     })
 }
 
@@ -159,20 +266,28 @@ function fetchMutesAndBlocks() {
             }
             resolve(true)
         } catch {
+            fetchData(true, true, false).then(reloadListeningScripts)
             resolve(false)
         }
     })
 }
 
-async function fetchData(token, mutesblocks) {
+async function fetchData(token, mutesblocks, resetapp) {
     return new Promise(async function(resolve) {
         var resolved = false
         try {
             settings = await (browser || chrome).storage.local.get(settingsDefaults)
             if (settings.fediact_homeinstance) {
                 if (token || mutesblocks) {
+                    if(resetapp) {
+                        await removeOauthData()
+                    }
+                    if (!(settings.fediact_client_id)) {
+                        await createApp()
+                    }
                     if (token || !(settings.fediact_token)) {
-                        await fetchBearerToken()
+                        await revokeToken()
+                        await prepareAuth()
                     }
                     if (mutesblocks) {
                         await fetchMutesAndBlocks()
@@ -208,10 +323,10 @@ async function reloadListeningScripts() {
 }
 
 // fetch api token right after install (mostly for debugging, when the ext. is reloaded)
-chrome.runtime.onInstalled.addListener(function(){fetchData(true, true)})
+chrome.runtime.onInstalled.addListener(function(){fetchData(true, true, true)})
 // and also every 3 minutes
 chrome.alarms.create('refresh', { periodInMinutes: tokenInterval })
-chrome.alarms.onAlarm.addListener(function(){fetchData(true, true)})
+chrome.alarms.onAlarm.addListener(function(){fetchData(false, true, false)})
 
 // different listeners for inter-script communication
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -227,11 +342,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     // immediately fetch api token after settings are updated
     if (request.updatedsettings) {
-        fetchData(true, true).then(reloadListeningScripts)
+        fetchData(true, true, true).then(reloadListeningScripts)
         return true
     }
     if (request.updatemutedblocked) {
-        fetchData(false, true).then(sendResponse)
+        fetchData(false, true, false).then(sendResponse)
         return true
     }
     // when the content script starts to process on a site, listen for tab changes (url)
